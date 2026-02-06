@@ -1,19 +1,18 @@
-FROM python:3.11-slim
+FROM python:3.9-slim-bullseye
 
-RUN apt update && apt install -y \
-    aria2 \
-    coreutils \
-    curl \
-    unzip \
+# Install system dependencies for libtorrent
+RUN apt-get update && apt-get install -y \
+    python3-libtorrent \
     && rm -rf /var/lib/apt/lists/*
 
-# install rclone
-RUN curl https://rclone.org/install.sh | bash
+# Set the PYTHONPATH so Python can find the libtorrent installed by apt
+ENV PYTHONPATH="/usr/lib/python3/dist-packages"
 
 WORKDIR /app
 COPY . .
 
-RUN mkdir -p /app/downloads
-RUN pip install --no-cache-dir python-telegram-bot==20.7
+# Install other requirements
+RUN pip install --no-cache-dir -r requirements.txt
 
-CMD ["python", "bot.py"]
+# Start Flask (for health check) and the Bot
+CMD gunicorn app:app --bind 0.0.0.0:$PORT --daemon && python3 bot.py
