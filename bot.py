@@ -12,12 +12,13 @@ from google.oauth2 import service_account
 from googleapiclient.http import MediaFileUpload
 
 # --- 1. EXTRACT SERVICE ACCOUNT JSON ---
+# This safely recreates the file from your Koyeb Environment Variable
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
-if not SERVICE_ACCOUNT_JSON:
-    print("ERROR: SERVICE_ACCOUNT_JSON environment variable is missing!")
-else:
+if SERVICE_ACCOUNT_JSON:
     with open('credentials.json', 'w') as f:
         f.write(SERVICE_ACCOUNT_JSON)
+else:
+    print("CRITICAL ERROR: SERVICE_ACCOUNT_JSON environment variable is missing!")
 
 # --- 2. CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", 0))
@@ -25,7 +26,7 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
 
-# Google Drive Setup
+# Google Drive Auth
 SCOPES = ['https://www.googleapis.com/auth/drive']
 try:
     creds = service_account.Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
@@ -33,22 +34,24 @@ try:
 except Exception as e:
     print(f"GDrive Auth Error: {e}")
 
-# Torrent Setup
+# Torrent Engine Setup
 app = Client("GDriveTorrentBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 ses = lt.session()
 ses.listen_on(6881, 6891)
 settings = {
     'announce_to_all_trackers': True, 
     'enable_dht': True, 
-    'download_rate_limit': 0,
+    'download_rate_limit': 0, # Max Speed
     'connections_limit': 200
 }
 ses.apply_settings(settings)
 
+# High-Performance Trackers
 TRACKERS = [
     "udp://tracker.opentrackr.org:1337/announce", 
     "udp://9.rarbg.com:2810/announce",
-    "udp://tracker.openbittorrent.com:6969/announce"
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://exodus.desync.com:6969/announce"
 ]
 
 active_tasks = {}
@@ -69,11 +72,11 @@ def get_prog_bar(pct):
     p = int(pct / 10)
     return "█" * p + "░" * (10 - p)
 
-# --- 4. BOT COMMANDS ---
+# --- 4. BOT HANDLERS ---
 
 @app.on_message(filters.command("start"))
 async def start(c, m):
-    await m.reply_text("👋 **Torrent to GDrive Bot (Fixed Version)**\nSend a magnet link to start.")
+    await m.reply_text("👋 **GDrive Torrent Bot (Python 3.11)**\nSend a magnet link to begin.")
 
 @app.on_message(filters.regex(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+"))
 async def handle_magnet(c, m):
@@ -81,32 +84,33 @@ async def handle_magnet(c, m):
     params = {'save_path': './downloads/', 'storage_mode': lt.storage_mode_t.storage_mode_sparse}
     handle = lt.add_magnet_uri(ses, magnet, params)
     
-    for t in TRACKERS: handle.add_tracker({'url': t, 'tier': 0})
+    for t in TRACKERS: 
+        handle.add_tracker({'url': t, 'tier': 0})
 
     status_msg = await m.reply_text("🧲 **Fetching Metadata...**")
-    while not handle.has_metadata(): await asyncio.sleep(1)
+    while not handle.has_metadata(): 
+        await asyncio.sleep(1)
     
     info = handle.get_torrent_info()
     h_hash = str(handle.info_hash())
     
-    # --- FIX: INITIALIZE THE TASK DICTIONARY ---
+    # Initialize task tracking to prevent KeyError
     active_tasks[h_hash] = {"handle": handle, "cancel": False}
     
-    handle.prioritize_files([0] * info.num_files()) # Skip all files initially
+    # Sequential Download Logic (Priority 0 skips all files initially)
+    handle.prioritize_files([0] * info.num_files())
 
-    await status_msg.edit(f"📂 **Torrent:** `{info.name()}`\nProcessing {info.num_files()} files sequentially...")
+    await status_msg.edit(f"📂 **Torrent Ready:** `{info.name()}`\nProcessing {info.num_files()} files one by one...")
 
     for i in range(info.num_files()):
-        # Check if user clicked cancel
         if active_tasks[h_hash]["cancel"]: break
         
         file = info.file_at(i)
-        if file.size < 5 * 1024 * 1024: continue # Skip files < 5MB
+        if file.size < 5 * 1024 * 1024: continue # Skip junk files < 5MB
         
-        handle.file_priority(i, 4) # Start downloading this file
+        handle.file_priority(i, 4) # Priority 4 is Normal
         f_name = file.path.split('/')[-1]
         
-        # Download Progress Loop
         while True:
             if active_tasks[h_hash]["cancel"]: break
             s = handle.status()
@@ -122,7 +126,7 @@ async def handle_magnet(c, m):
                 await status_msg.edit(
                     f"📥 **Downloading:** `{f_name}`\n"
                     f"[{get_prog_bar(pct)}] {pct:.1f}%\n"
-                    f"🚀 Speed: {humanize.naturalsize(s.download_rate)}/s",
+                    f"🚀 {humanize.naturalsize(s.download_rate)}/s | 👥 Peers: {s.num_peers}",
                     reply_markup=ctrl_btn
                 )
             except: pass
@@ -130,7 +134,7 @@ async def handle_magnet(c, m):
             if f_prog >= file.size: break
             await asyncio.sleep(5)
 
-        # Upload to Google Drive (only if not cancelled)
+        # Upload and Delete
         if not active_tasks[h_hash]["cancel"]:
             await status_msg.edit(f"☁️ **Uploading to GDrive:** `{f_name}`")
             f_path = os.path.join("./downloads/", file.path)
@@ -138,21 +142,21 @@ async def handle_magnet(c, m):
             try:
                 loop = asyncio.get_event_loop()
                 link = await loop.run_in_executor(None, upload_to_gdrive, f_path, f_name)
-                await m.reply_text(f"✅ **Uploaded:** `{f_name}`\n🔗 [View in GDrive]({link})", disable_web_page_preview=True)
+                await m.reply_text(f"✅ **Uploaded:** `{f_name}`\n🔗 [View File]({link})", disable_web_page_preview=True)
             except Exception as e:
-                await m.reply_text(f"❌ Upload Failed: {e}")
+                await m.reply_text(f"❌ GDrive Error: {e}")
             finally:
                 if os.path.exists(f_path): os.remove(f_path)
-                handle.file_priority(i, 0) # Clear from disk
+                handle.file_priority(i, 0) # Free disk space
 
-    await status_msg.edit("🏁 **Torrent processing finished.**")
+    await status_msg.edit("🏁 **Finished.** Disk space cleared.")
     active_tasks.pop(h_hash, None)
 
 @app.on_callback_query(filters.regex(r"^(pa|re|ca)_"))
 async def btn_controls(c, q: CallbackQuery):
     act, h_id = q.data.split("_")
     if h_id not in active_tasks: 
-        return await q.answer("Task not found or already finished.", show_alert=True)
+        return await q.answer("Task not found.", show_alert=True)
     
     h = active_tasks[h_id]["handle"]
     if act == "pa":
@@ -167,8 +171,7 @@ async def btn_controls(c, q: CallbackQuery):
     elif act == "ca":
         active_tasks[h_id]["cancel"] = True
         ses.remove_torrent(h)
-        await q.message.edit("❌ Task Cancelled by User.")
-        active_tasks.pop(h_id, None)
+        await q.message.edit("❌ Download Cancelled.")
 
 if __name__ == "__main__":
     app.run()
