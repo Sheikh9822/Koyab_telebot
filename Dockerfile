@@ -8,6 +8,7 @@ RUN apt update && apt install -y \
 WORKDIR /app
 COPY . .
 
+RUN mkdir -p /app/downloads
 RUN pip install --no-cache-dir -r requirements.txt
 
 CMD ["python", "bot.py"]
