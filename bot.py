@@ -1,4 +1,5 @@
-import os, re, time, asyncio, subprocess, signal
+import os, re, time, asyncio, subprocess, signal, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -13,10 +14,12 @@ from telegram.ext import (
     filters
 )
 
+# ---------------- CONFIG ----------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BASE_DIR = "/app/downloads"
 ARIA2_CONF = "/app/aria2.conf"
 TG_LIMIT = 2 * 1024**3
+GDRIVE_REMOTE = "gdrive:TelegramTorrents"
 
 os.makedirs(BASE_DIR, exist_ok=True)
 
@@ -26,8 +29,17 @@ STATE = {
     "cancel": False
 }
 
-# ---------- UI ----------
+# ---------------- HEALTH SERVER ----------------
+def health_server():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
 
+    HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+
+# ---------------- UI ----------------
 def bar(p, w=14):
     return "█" * int(w*p/100) + "░" * (w - int(w*p/100))
 
@@ -42,8 +54,7 @@ def buttons(paused=False):
         ]
     ])
 
-# ---------- Anime helpers ----------
-
+# ---------------- ANIME HELPERS ----------------
 def clean_name(name):
     name = re.sub(r"\[.*?\]", "", name)
     name = re.sub(r"\(.*?\)", "", name)
@@ -62,11 +73,11 @@ def sort_anime(path):
     os.makedirs(target, exist_ok=True)
 
     new = f"{target}/{ep}.mkv"
-    os.rename(path, new)
+    if not os.path.exists(new):
+        os.rename(path, new)
     return new
 
-# ---------- Controls ----------
-
+# ---------------- BUTTON HANDLER ----------------
 async def control(update, context):
     q = update.callback_query
     await q.answer()
@@ -88,8 +99,7 @@ async def control(update, context):
         await q.edit_message_text("❌ Cancelled")
         cleanup()
 
-# ---------- Download ----------
-
+# ---------------- DOWNLOAD ----------------
 async def download(update, link):
     cmd = [
         "aria2c",
@@ -145,16 +155,15 @@ async def download(update, link):
     STATE["process"] = None
     await msg.edit_text("✅ Download complete")
 
-# ---------- Upload ----------
-
-async def upload(update, path):
+# ---------------- TELEGRAM UPLOAD ----------------
+async def upload_tg(update, path):
     size = os.path.getsize(path)
-    msg = await update.message.reply_text("📤 Uploading…")
+    msg = await update.message.reply_text("📤 Uploading to Telegram…")
 
     async def progress(cur, total):
         p = int(cur * 100 / total)
         await msg.edit_text(
-            f"📤 Uploading\n{bar(p)} {p}%\n"
+            f"📤 Telegram Upload\n{bar(p)} {p}%\n"
             f"{cur//1024//1024}MB / {total//1024//1024}MB"
         )
 
@@ -164,42 +173,63 @@ async def upload(update, path):
         progress=progress
     )
 
-    await msg.edit_text("✅ Uploaded")
+    await msg.edit_text("✅ Telegram upload done")
 
-# ---------- Cleanup ----------
+# ---------------- GOOGLE DRIVE UPLOAD ----------------
+async def upload_gdrive(update):
+    msg = await update.message.reply_text("☁️ Uploading to Google Drive…")
 
+    subprocess.run([
+        "rclone", "copy",
+        BASE_DIR,
+        GDRIVE_REMOTE,
+        "--transfers", "4",
+        "--checkers", "4",
+        "--drive-chunk-size", "64M",
+        "--stats=2s"
+    ])
+
+    await msg.edit_text("✅ Uploaded to Google Drive")
+
+# ---------------- CLEANUP ----------------
 def cleanup():
     subprocess.run(["rm", "-rf", BASE_DIR])
     os.makedirs(BASE_DIR, exist_ok=True)
     STATE.update({"process": None, "paused": False, "cancel": False})
 
-# ---------- Handler ----------
-
+# ---------------- HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send magnet / torrent\n"
-        "• Episode-wise progress\n"
+        "Send magnet or torrent\n"
+        "• Inline progress\n"
         "• Pause / Resume / Cancel\n"
-        "• Auto cleanup"
+        "• Telegram + Google Drive"
     )
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = update.message.text
+
     await download(update, link)
 
+    # sort + upload episodes to Telegram
     for root, _, files in os.walk(BASE_DIR):
         for f in files:
             path = sort_anime(os.path.join(root, f))
             if os.path.getsize(path) <= TG_LIMIT:
-                await upload(update, path)
+                await upload_tg(update, path)
+
+    # upload full batch to Drive
+    await upload_gdrive(update)
 
     cleanup()
     await update.message.reply_text("🎉 All done")
 
-# ---------- Run ----------
+# ---------------- RUN ----------------
+threading.Thread(target=health_server, daemon=True).start()
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(control))
 app.add_handler(MessageHandler(filters.TEXT, handle))
+
 app.run_polling()
