@@ -5,7 +5,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def health():
-    return "Bot is running perfectly!", 200
+    return "PTB Bot is Live!", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
