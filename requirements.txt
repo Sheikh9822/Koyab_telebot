@@ -1,7 +1,5 @@
-python-telegram-bot
 pyrogram
 tgcrypto
-libtorrent
 flask
 gunicorn
 parse-torrent-title
