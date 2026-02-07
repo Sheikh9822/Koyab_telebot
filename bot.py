@@ -1,36 +1,39 @@
-import os, asyncio, time, json, libtorrent as lt, humanize, PTN
+import os, asyncio, time, json, libtorrent as lt, humanize
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import FloodWait
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.http import MediaFileUpload
 
-# --- 1. SETUP & REPAIR CREDENTIALS ---
-SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
-if SERVICE_ACCOUNT_JSON:
-    try:
-        # Repairing Koyeb newline issues
-        parsed_json = json.loads(SERVICE_ACCOUNT_JSON.replace("\\n", "\n"))
-        with open('credentials.json', 'w') as f:
-            json.dump(parsed_json, f)
-    except Exception as e:
-        print(f"JSON Error: {e}")
-
-# --- 2. CONFIG ---
+# --- 1. GLOBALS & CONFIG ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
 INDEX_URL = os.environ.get("INDEX_URL", "").rstrip('/')
 
-try:
-    creds = service_account.Credentials.from_service_account_file('credentials.json', scopes=['https://www.googleapis.com/auth/drive'])
-    drive_service = build('drive', 'v3', credentials=creds)
-except Exception as e:
-    print(f"Auth Init Error: {e}")
+# Global variable for GDrive service
+drive_service = None
 
-app = Client("LeechBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# --- 2. AUTHENTICATION INIT ---
+SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
+if SERVICE_ACCOUNT_JSON:
+    try:
+        # Fix Koyeb newline escapes
+        json_data = json.loads(SERVICE_ACCOUNT_JSON.replace("\\n", "\n"))
+        with open('credentials.json', 'w') as f:
+            json.dump(json_data, f)
+        
+        creds = service_account.Credentials.from_service_account_file(
+            'credentials.json', 
+            scopes=['https://www.googleapis.com/auth/drive']
+        )
+        drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+        print("✅ Google Drive Service Initialized")
+    except Exception as e:
+        print(f"❌ Auth Initialization Error: {e}")
+
+# Torrent Session
 ses = lt.session()
 ses.listen_on(6881, 6891)
 
@@ -40,7 +43,14 @@ FILES_PER_PAGE = 8
 # --- 3. HELPERS ---
 
 def upload_to_gdrive(file_path, file_name):
+    if not drive_service:
+        raise Exception("GDrive Service not initialized. Check your credentials.")
+    
     try:
+        # Final check: is the file empty?
+        if os.path.getsize(file_path) == 0:
+            raise Exception("File is 0 bytes. Torrent data not flushed to disk yet.")
+
         meta = {'name': file_name, 'parents': [GDRIVE_FOLDER_ID]}
         media = MediaFileUpload(file_path, mimetype='application/octet-stream', resumable=True)
         request = drive_service.files().create(body=meta, media_body=media, fields='id, webViewLink')
@@ -50,7 +60,6 @@ def upload_to_gdrive(file_path, file_name):
             status, response = request.next_chunk()
         return response.get('webViewLink')
     except Exception as e:
-        # This will now capture the specific JSON error from Google
         raise Exception(str(e))
 
 def get_prog_bar(pct):
@@ -77,25 +86,34 @@ def gen_selection_kb(h_hash, page=0):
 
 # --- 4. HANDLERS ---
 
+app = Client("LeechBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply_text("👋 Send a Magnet Link.")
 
 @app.on_message(filters.regex(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+"))
 async def handle_magnet(c, m):
-    handle = lt.add_magnet_uri(ses, m.text, {'save_path': './downloads/'})
-    msg = await m.reply_text("🧲 **Fetching Metadata...**")
-    while not handle.has_metadata(): await asyncio.sleep(1)
-    
-    info = handle.get_torrent_info()
-    h_hash = str(handle.info_hash())
-    files = [{"name": info.file_at(i).path.split('/')[-1], "size": info.file_at(i).size} for i in range(info.num_files())]
-    
-    active_tasks[h_hash] = {"handle": handle, "selected": [], "files": files, "chat_id": m.chat.id, "msg_id": msg.id, "cancel": False}
-    handle.prioritize_files([0] * info.num_files())
-    await msg.edit("✅ Select files:", reply_markup=gen_selection_kb(h_hash))
+    try:
+        handle = lt.add_magnet_uri(ses, m.text, {'save_path': './downloads/'})
+        # Add trackers for speed
+        handle.add_tracker({'url': "udp://tracker.opentrackr.org:1337/announce", 'tier': 0})
+        
+        msg = await m.reply_text("🧲 **Fetching Metadata...**")
+        while not handle.has_metadata(): 
+            await asyncio.sleep(1)
+        
+        info = handle.get_torrent_info()
+        h_hash = str(handle.info_hash())
+        files = [{"name": info.file_at(i).path.split('/')[-1], "size": info.file_at(i).size} for i in range(info.num_files())]
+        
+        active_tasks[h_hash] = {"handle": handle, "selected": [], "files": files, "chat_id": m.chat.id, "msg_id": msg.id, "cancel": False}
+        handle.prioritize_files([0] * info.num_files())
+        await msg.edit(f"📂 **{info.name()}**\nSelect files:", reply_markup=gen_selection_kb(h_hash))
+    except Exception as e:
+        await m.reply_text(f"❌ Error: {e}")
 
-@app.on_callback_query(filters.regex(r"^(tog|page|startdl|ca|pa|re)_"))
+@app.on_callback_query(filters.regex(r"^(tog|page|startdl|ca)_"))
 async def callbacks(c, q: CallbackQuery):
     d = q.data.split("_")
     action, h_hash = d[0], d[1]
@@ -113,8 +131,9 @@ async def callbacks(c, q: CallbackQuery):
         if not task["selected"]: return await q.answer("Select a file!")
         asyncio.create_task(run_download(c, h_hash))
     elif action == "ca":
-        task["cancel"] = True; ses.remove_torrent(task["handle"])
-        await q.message.edit("❌ Cancelled."); active_tasks.pop(h_hash, None)
+        task["cancel"] = True
+        ses.remove_torrent(task["handle"])
+        await q.message.edit("❌ Cancelled.")
 
 async def run_download(c, h_hash):
     task = active_tasks[h_hash]
@@ -143,19 +162,32 @@ async def run_download(c, h_hash):
             await asyncio.sleep(5)
 
         if not task["cancel"]:
-            await c.edit_message_text(task["chat_id"], task["msg_id"], f"☁️ **Uploading to GDrive:** `{f_name}`")
+            # 1. Force Disk Flush
+            handle.save_resume_data() 
+            await asyncio.sleep(3) # Small buffer to let the OS close the file handle
+
             f_path = os.path.join("./downloads/", file.path)
+            
+            # 2. Path correction for multi-file torrents
+            # Libtorrent saves multi-file torrents in a subfolder named after the torrent
+            if not os.path.exists(f_path):
+                f_path = os.path.join("./downloads/", info.name(), file.path)
+
+            await c.edit_message_text(task["chat_id"], task["msg_id"], f"☁️ **Uploading to GDrive:** `{f_name}`")
+            
             try:
-                loop = asyncio.get_event_loop()
-                glink = await loop.run_in_executor(None, upload_to_gdrive, f_path, f_name)
-                
-                out = f"✅ **Uploaded:** `{f_name}`\n🔗 [GDrive Link]({glink})"
-                if INDEX_URL:
-                    out += f"\n⚡ [Direct Link]({INDEX_URL}/{f_name.replace(' ', '%20')})"
-                
-                await c.send_message(task["chat_id"], out, disable_web_page_preview=True)
+                # 3. Final Verification before upload
+                if os.path.exists(f_path) and os.path.getsize(f_path) > 0:
+                    loop = asyncio.get_event_loop()
+                    glink = await loop.run_in_executor(None, upload_to_gdrive, f_path, f_name)
+                    
+                    out = f"✅ **Uploaded:** `{f_name}`\n🔗 [GDrive Link]({glink})"
+                    if INDEX_URL:
+                        out += f"\n⚡ [Direct Link]({INDEX_URL}/{f_name.replace(' ', '%20')})"
+                    await c.send_message(task["chat_id"], out, disable_web_page_preview=True)
+                else:
+                    await c.send_message(task["chat_id"], f"❌ Error: File `{f_name}` is empty or not found on disk.")
             except Exception as e:
-                # This will now show the REAL error reason in Telegram
                 await c.send_message(task["chat_id"], f"❌ UPLOAD FAILED: `{f_name}`\nReason: {e}")
             finally:
                 if os.path.exists(f_path): os.remove(f_path)
