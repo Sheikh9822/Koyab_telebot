@@ -32,8 +32,9 @@ except Exception as e:
     print(f"GDrive Auth Error: {e}")
 
 # --- 2. TORRENT ENGINE SETUP ---
-# listen_interfaces fix for deprecation
-ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
+# Standard session setup for Libtorrent 1.2.x
+ses = lt.session()
+ses.listen_on(6881, 6891)
 ses.apply_settings({
     'announce_to_all_trackers': True,
     'enable_dht': True,
@@ -63,8 +64,6 @@ def upload_to_gdrive(file_path, file_name):
         response = None
         while response is None:
             status, response = request.next_chunk()
-            if status:
-                print(f"Uploading {file_name}: {int(status.progress() * 100)}%")
         return response.get('webViewLink')
     except Exception as e:
         raise Exception(f"Google Drive API Error: {str(e)}")
@@ -96,35 +95,30 @@ def gen_selection_kb(h_hash, page=0):
 
 @app.on_message(filters.command("start"))
 async def start(c, m):
-    await m.reply_text("👋 **Advanced Torrent to GDrive Bot**\nSend a magnet link to start.")
+    await m.reply_text("👋 **Torrent to GDrive Bot**\nSend a magnet link to start.")
 
 @app.on_message(filters.regex(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+"))
 async def handle_magnet(c, m):
     try:
-        # Modern Libtorrent 2.0 way to add magnet
-        params = lt.parse_magnet_uri(m.text)
-        params.save_path = './downloads/'
-        handle = ses.add_torrent(params)
+        handle = lt.add_magnet_uri(ses, m.text, {'save_path': './downloads/'})
         for t in TRACKERS: handle.add_tracker({'url': t, 'tier': 0})
     except Exception as e:
-        return await m.reply_text(f"❌ Invalid Magnet: {e}")
+        return await m.reply_text(f"❌ Error: {e}")
 
     msg = await m.reply_text("🧲 **Fetching Metadata...**")
     
-    # Modern metadata check
-    while not handle.status().has_metadata: 
+    while not handle.has_metadata(): 
         await asyncio.sleep(1)
     
-    # Modern way to get file info
-    info = handle.get_torrent_copy()
+    # Use get_torrent_info() for 1.2.x compatibility
+    info = handle.get_torrent_info()
     h_hash = str(handle.info_hash())
-    storage = info.files()
+    
     files = []
-    for i in range(storage.num_files()):
+    for i in range(info.num_files()):
         files.append({
-            "name": storage.file_path(i).split('/')[-1], 
-            "size": storage.file_size(i),
-            "full_path": storage.file_path(i)
+            "name": info.file_at(i).path.split('/')[-1], 
+            "size": info.file_at(i).size
         })
 
     active_tasks[h_hash] = {
@@ -163,21 +157,20 @@ async def callbacks(c, q: CallbackQuery):
 async def run_download(c, h_hash):
     task = active_tasks[h_hash]
     handle = task["handle"]
-    info = handle.get_torrent_copy()
-    storage = info.files()
+    info = handle.get_torrent_info()
     
     for idx in sorted(task["selected"]):
         if task["cancel"]: break
         
         handle.file_priority(idx, 4)
-        f_name = storage.file_path(idx).split('/')[-1]
-        f_size = storage.file_size(idx)
+        file = info.file_at(idx)
+        f_name = file.path.split('/')[-1]
         
         while True:
             if task["cancel"]: break
             s = handle.status()
             f_prog = handle.file_progress()[idx]
-            pct = (f_prog / f_size) * 100 if f_size > 0 else 100
+            pct = (f_prog / file.size) * 100 if file.size > 0 else 100
             
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("⏸ Pause" if not s.paused else "▶️ Resume", callback_data=f"{'pa' if not s.paused else 're'}_{h_hash}")],
@@ -191,17 +184,13 @@ async def run_download(c, h_hash):
                     f"🚀 {humanize.naturalsize(s.download_rate)}/s | 👥 P: {s.num_peers} S: {s.num_seeds}",
                     reply_markup=kb)
             except: pass
-            if f_prog >= f_size: break
+            if f_prog >= file.size: break
             await asyncio.sleep(5)
 
         if not task["cancel"]:
             await c.edit_message_text(task["chat_id"], task["msg_id"], f"☁️ **Uploading to GDrive:** `{f_name}`")
-            f_path = os.path.join("./downloads/", storage.file_path(idx))
+            f_path = os.path.join("./downloads/", file.path)
             
-            if not os.path.exists(f_path):
-                await c.send_message(task["chat_id"], f"❌ Error: File not found on disk.")
-                continue
-
             try:
                 loop = asyncio.get_event_loop()
                 glink = await loop.run_in_executor(None, upload_to_gdrive, f_path, f_name)
@@ -228,6 +217,5 @@ if __name__ == "__main__":
             app.run()
         except FloodWait as e:
             time.sleep(e.value + 5)
-        except Exception as e:
-            print(f"Error: {e}")
+        except Exception:
             time.sleep(10)
