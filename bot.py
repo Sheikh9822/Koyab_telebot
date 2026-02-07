@@ -36,7 +36,6 @@ SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON") # Method 2: Shared
 try:
     if TOKEN_JSON:
         # Load credentials from the Token JSON you generated
-        # This logs in as YOU, solving the quota issue
         info = json.loads(TOKEN_JSON)
         creds = Credentials.from_authorized_user_info(info, ['https://www.googleapis.com/auth/drive'])
         drive_service = build('drive', 'v3', credentials=creds)
@@ -50,7 +49,7 @@ try:
         drive_service = build('drive', 'v3', credentials=creds)
         logger.info("✅ Google Drive Authenticated (Service Account)")
     else:
-        logger.warning("⚠️ No Google Drive Credentials found! Uploads will fail.")
+        logger.warning("⚠️ No Google Drive Credentials found!")
         
 except Exception as e:
     logger.error(f"❌ GDrive Auth Failed: {e}")
@@ -114,7 +113,6 @@ def gen_keyboard(h_hash, page=0):
     for i, file in enumerate(files[start:end]):
         idx = start + i
         icon = "✅" if idx in selected else "⬜"
-        # Truncate long names for button labels
         name = file['name']
         if len(name) > 30: name = name[:15] + "..." + name[-10:]
         btns.append([InlineKeyboardButton(f"{icon} {name}", callback_data=f"tog_{h_hash}_{idx}_{page}")])
@@ -137,7 +135,6 @@ async def start(c, m):
 @app.on_message(filters.regex(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+"))
 async def add_magnet(c, m):
     try:
-        # Clean up old downloads
         if os.path.exists(DOWNLOAD_DIR): 
             shutil.rmtree(DOWNLOAD_DIR)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -156,7 +153,7 @@ async def add_magnet(c, m):
     while not handle.has_metadata():
         if time.time() - start_time > 60:
             ses.remove_torrent(handle)
-            return await msg.edit("❌ Metadata timeout. Try a better magnet link.")
+            return await msg.edit("❌ Metadata timeout.")
         await asyncio.sleep(2)
     
     info = handle.get_torrent_info()
@@ -171,12 +168,11 @@ async def add_magnet(c, m):
         "chat_id": m.chat.id, "msg_id": msg.id, "cancel": False
     }
     
-    # Pause all initially
     handle.prioritize_files([0] * info.num_files())
     await msg.edit(f"📂 **Metadata Found!**\nFiles: {len(files)}", reply_markup=gen_keyboard(h_hash))
 
 @app.on_callback_query()
-async def cb_handler(c, q):
+async def cb_handler(c, q: CallbackQuery):
     data = q.data.split("_")
     action, h_hash = data[0], data[1]
     task = active_tasks.get(h_hash)
@@ -208,25 +204,26 @@ async def downloader(c, h_hash):
     handle = task["handle"]
     info = handle.get_torrent_info()
     
-    # Set priority to 4 (Download)
     for idx in task["selected"]: handle.file_priority(idx, 4)
     
     while not handle.is_seed():
         if task["cancel"]: return
         s = handle.status()
         
-        # Calculate specific progress
         total = sum(task["files"][i]["size"] for i in task["selected"])
         done = sum(handle.file_progress()[i] for i in task["selected"])
         pct = (done / total * 100) if total > 0 else 0
         
         try:
+            # FIX: Properly balanced parentheses here
             await c.edit_message_text(
-                task["chat_id"], task["msg_id"],
-                f"📥 **Downloading...**\n[{get_prog_bar(pct)}] {pct:.1f}%\n⚡ {humanize.naturalsize(s.download_rate)}/s",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{h_hash}")]]))
+                chat_id=task["chat_id"], 
+                message_id=task["msg_id"],
+                text=f"📥 **Downloading...**\n[{get_prog_bar(pct)}] {pct:.1f}%\n⚡ {humanize.naturalsize(s.download_rate)}/s",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{h_hash}")]])
             )
-        except: pass
+        except: 
+            pass
         
         if done >= total: break
         await asyncio.sleep(4)
