@@ -115,7 +115,6 @@ async def handle_magnet(c, m):
     
     info = handle.get_torrent_info()
     h_hash = str(handle.info_hash())
-    
     files = [{"name": info.files().file_name(i), "size": info.files().file_size(i)} for i in range(info.num_files())]
 
     active_tasks[h_hash] = {
@@ -159,7 +158,7 @@ async def cb_handler(c, q: CallbackQuery):
 
 async def downloader(c, h_hash):
     task = active_tasks[h_hash]
-    handle, info = task["handle"], task["handle"].get_torrent_info()
+    handle = task["handle"]
     
     for idx in task["selected"]: handle.file_priority(idx, 4)
     
@@ -182,6 +181,7 @@ async def downloader(c, h_hash):
         
     await c.edit_message_text(task["chat_id"], task["msg_id"], "📤 **Uploading to Drive...**")
     
+    info = handle.get_torrent_info()
     for idx in task["selected"]:
         if task["cancel"]: break
         name = info.files().file_name(idx)
