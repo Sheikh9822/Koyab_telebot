@@ -14,13 +14,14 @@ from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from googleapiclient.http import MediaFileUpload
 
+# --- CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "") # Your "Telebot" folder ID
 INDEX_URL = os.environ.get("INDEX_URL", "").rstrip('/')
 DOWNLOAD_DIR = "/app/downloads/"
 
@@ -41,17 +42,33 @@ except Exception as e:
 
 # --- LIBTORRENT SETUP ---
 ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
-
 TRACKERS = ["udp://tracker.opentrackr.org:1337/announce", "udp://open.stealth.si:80/announce", "udp://exodus.desync.com:6969/announce"]
 
 app = Client("KoyebBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 active_tasks = {}
 FILES_PER_PAGE = 8
 
-def upload_to_gdrive(file_path, file_name):
+# --- GDRIVE FOLDER UTILS ---
+
+def create_gdrive_folder(folder_name, parent_id):
+    """Creates a folder on Google Drive and returns its ID."""
+    if not drive_service: return None
+    try:
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder',
+            'parents': [parent_id]
+        }
+        folder = drive_service.files().create(body=file_metadata, fields='id', supportsAllDrives=True).execute()
+        return folder.get('id')
+    except Exception as e:
+        logger.error(f"Folder Creation Error: {e}")
+        return parent_id # Fallback to parent if creation fails
+
+def upload_to_gdrive(file_path, file_name, parent_id):
     if not drive_service: return "Error: Drive not configured."
     try:
-        meta = {'name': file_name, 'parents': [GDRIVE_FOLDER_ID]}
+        meta = {'name': file_name, 'parents': [parent_id]}
         media = MediaFileUpload(file_path, resumable=True)
         request = drive_service.files().create(body=meta, media_body=media, fields='id, webViewLink', supportsAllDrives=True)
         response = None
@@ -60,6 +77,8 @@ def upload_to_gdrive(file_path, file_name):
         return response.get('webViewLink')
     except Exception as e:
         return f"Upload Error: {str(e)}"
+
+# --- UI HELPERS ---
 
 def get_prog_bar(pct):
     p = int(pct / 10)
@@ -85,6 +104,8 @@ def gen_keyboard(h_hash, page=0):
     btns.append([InlineKeyboardButton("❌ CANCEL", callback_data=f"cancel_{h_hash}")])
     return InlineKeyboardMarkup(btns)
 
+# --- HANDLERS ---
+
 @app.on_message(filters.command("start"))
 async def start_cmd(c, m):
     await m.reply_text("👋 **Torrent to GDrive Bot**\nSend a Magnet Link.")
@@ -105,11 +126,22 @@ async def handle_magnet(c, m):
     
     t_info = handle.status().torrent_file
     h_hash = str(handle.info_hash())
+    # Save the Torrent Name for folder creation later
+    t_name = handle.status().name
+    
     files = [{"name": t_info.files().file_name(i), "size": t_info.files().file_size(i)} for i in range(t_info.num_files())]
 
-    active_tasks[h_hash] = {"handle": handle, "files": files, "selected": [], "chat_id": m.chat.id, "msg_id": msg.id, "cancel": False}
+    active_tasks[h_hash] = {
+        "handle": handle, 
+        "files": files, 
+        "selected": [], 
+        "chat_id": m.chat.id, 
+        "msg_id": msg.id, 
+        "cancel": False,
+        "t_name": t_name
+    }
     handle.prioritize_files([0] * t_info.num_files())
-    try: await msg.edit(f"📂 **Metadata Found!**\nFiles: {len(files)}", reply_markup=gen_keyboard(h_hash))
+    try: await msg.edit(f"📂 **Metadata Found!**\nTorrent: `{t_name}`\nFiles: {len(files)}", reply_markup=gen_keyboard(h_hash))
     except MessageNotModified: pass
 
 @app.on_callback_query()
@@ -149,11 +181,16 @@ async def downloader(c, h_hash):
         done = sum(handle.file_progress()[i] for i in task["selected"])
         pct = (done / total * 100) if total > 0 else 0
         try:
-            await c.edit_message_text(task["chat_id"], task["msg_id"], f"📥 **Downloading...**\n[{get_prog_bar(pct)}] {pct:.1f}%\n⚡ {humanize.naturalsize(s.download_rate)}/s", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{h_hash}")]]))
+            await c.edit_message_text(task["chat_id"], task["msg_id"], f"📥 **Downloading...**\n`{task['t_name']}`\n[{get_prog_bar(pct)}] {pct:.1f}%\n⚡ {humanize.naturalsize(s.download_rate)}/s", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{h_hash}")]]))
         except (MessageNotModified, FloodWait): pass
         if done >= total: break
         await asyncio.sleep(5)
         
+    await c.edit_message_text(task["chat_id"], task["msg_id"], "📁 **Creating Folder on Drive...**")
+    
+    # NEW: Create a dedicated folder for this torrent
+    target_folder_id = await asyncio.get_event_loop().run_in_executor(None, create_gdrive_folder, task['t_name'], GDRIVE_FOLDER_ID)
+    
     await c.edit_message_text(task["chat_id"], task["msg_id"], "📤 **Uploading to Drive...**")
     t_file = handle.status().torrent_file
     for idx in task["selected"]:
@@ -162,10 +199,13 @@ async def downloader(c, h_hash):
         if os.path.exists(path):
             try: await c.edit_message_text(task["chat_id"], task["msg_id"], f"☁️ **Uploading:** `{name}`")
             except MessageNotModified: pass
-            link = await asyncio.get_event_loop().run_in_executor(None, upload_to_gdrive, path, name)
+            
+            # Upload into the specific Torrent Folder
+            link = await asyncio.get_event_loop().run_in_executor(None, upload_to_gdrive, path, name, target_folder_id)
             if "http" in str(link):
                 msg = f"✅ **{name}**\n🔗 [GDrive Link]({link})"
-                if INDEX_URL: msg += f"\n⚡ [Direct Link]({INDEX_URL}/{name.replace(' ', '%20')})"
+                if INDEX_URL: 
+                    msg += f"\n⚡ [Direct Link]({INDEX_URL}/{task['t_name'].replace(' ', '%20')}/{name.replace(' ', '%20')})"
                 await c.send_message(task["chat_id"], msg, disable_web_page_preview=True)
             else: await c.send_message(task["chat_id"], f"❌ Upload Failed: {link}")
 
