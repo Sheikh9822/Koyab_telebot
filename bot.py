@@ -8,7 +8,7 @@ import libtorrent as lt
 import humanize
 from pathlib import Path
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
@@ -25,27 +25,32 @@ GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
 INDEX_URL = os.environ.get("INDEX_URL", "").rstrip('/')
 DOWNLOAD_DIR = "/app/downloads/"
 
+# Ensure download directory exists
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
 # --- GDRIVE AUTHENTICATION ---
 drive_service = None
-TOKEN_JSON = os.environ.get("TOKEN_JSON") # <--- NEW: For Personal Accounts
-SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
+TOKEN_JSON = os.environ.get("TOKEN_JSON")             # Method 1: Personal Account (The fix)
+SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON") # Method 2: Shared Drive
 
 try:
     if TOKEN_JSON:
-        # Option 1: User Auth (Fixes Personal Drive Quota Issue)
-        creds = Credentials.from_authorized_user_info(json.loads(TOKEN_JSON), ['https://www.googleapis.com/auth/drive'])
+        # Load credentials from the Token JSON you generated
+        # This logs in as YOU, solving the quota issue
+        info = json.loads(TOKEN_JSON)
+        creds = Credentials.from_authorized_user_info(info, ['https://www.googleapis.com/auth/drive'])
         drive_service = build('drive', 'v3', credentials=creds)
         logger.info("✅ Google Drive Authenticated (User Mode)")
         
     elif SERVICE_ACCOUNT_JSON:
-        # Option 2: Service Account (Only for Shared Drives)
+        # Fallback for Shared Drive users
         cred_dict = json.loads(SERVICE_ACCOUNT_JSON)
         creds = service_account.Credentials.from_service_account_info(
             cred_dict, scopes=['https://www.googleapis.com/auth/drive'])
         drive_service = build('drive', 'v3', credentials=creds)
         logger.info("✅ Google Drive Authenticated (Service Account)")
+    else:
+        logger.warning("⚠️ No Google Drive Credentials found! Uploads will fail.")
         
 except Exception as e:
     logger.error(f"❌ GDrive Auth Failed: {e}")
@@ -67,11 +72,11 @@ app = Client("KoyebBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 active_tasks = {}
 FILES_PER_PAGE = 8
 
-# --- FUNCTIONS ---
+# --- HELPERS ---
 
 def upload_to_gdrive(file_path, file_name):
     if not drive_service:
-        return "Error: Google Drive not configured."
+        return "Error: GDrive not configured."
     
     try:
         file_metadata = {'name': file_name, 'parents': [GDRIVE_FOLDER_ID]}
@@ -109,7 +114,7 @@ def gen_keyboard(h_hash, page=0):
     for i, file in enumerate(files[start:end]):
         idx = start + i
         icon = "✅" if idx in selected else "⬜"
-        # Truncate long names
+        # Truncate long names for button labels
         name = file['name']
         if len(name) > 30: name = name[:15] + "..." + name[-10:]
         btns.append([InlineKeyboardButton(f"{icon} {name}", callback_data=f"tog_{h_hash}_{idx}_{page}")])
@@ -132,7 +137,9 @@ async def start(c, m):
 @app.on_message(filters.regex(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+"))
 async def add_magnet(c, m):
     try:
-        if os.path.exists(DOWNLOAD_DIR): shutil.rmtree(DOWNLOAD_DIR)
+        # Clean up old downloads
+        if os.path.exists(DOWNLOAD_DIR): 
+            shutil.rmtree(DOWNLOAD_DIR)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         params = lt.parse_magnet_uri(m.text)
@@ -149,7 +156,7 @@ async def add_magnet(c, m):
     while not handle.has_metadata():
         if time.time() - start_time > 60:
             ses.remove_torrent(handle)
-            return await msg.edit("❌ Metadata timeout.")
+            return await msg.edit("❌ Metadata timeout. Try a better magnet link.")
         await asyncio.sleep(2)
     
     info = handle.get_torrent_info()
@@ -164,6 +171,7 @@ async def add_magnet(c, m):
         "chat_id": m.chat.id, "msg_id": msg.id, "cancel": False
     }
     
+    # Pause all initially
     handle.prioritize_files([0] * info.num_files())
     await msg.edit(f"📂 **Metadata Found!**\nFiles: {len(files)}", reply_markup=gen_keyboard(h_hash))
 
@@ -200,12 +208,14 @@ async def downloader(c, h_hash):
     handle = task["handle"]
     info = handle.get_torrent_info()
     
+    # Set priority to 4 (Download)
     for idx in task["selected"]: handle.file_priority(idx, 4)
     
     while not handle.is_seed():
         if task["cancel"]: return
         s = handle.status()
         
+        # Calculate specific progress
         total = sum(task["files"][i]["size"] for i in task["selected"])
         done = sum(handle.file_progress()[i] for i in task["selected"])
         pct = (done / total * 100) if total > 0 else 0
@@ -217,6 +227,7 @@ async def downloader(c, h_hash):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{h_hash}")]]))
             )
         except: pass
+        
         if done >= total: break
         await asyncio.sleep(4)
         
@@ -234,7 +245,10 @@ async def downloader(c, h_hash):
             link = await loop.run_in_executor(None, upload_to_gdrive, path, name)
             
             if "http" in str(link):
-                await c.send_message(task["chat_id"], f"✅ **{name}**\n🔗 [GDrive Link]({link})", disable_web_page_preview=True)
+                msg = f"✅ **{name}**\n🔗 [GDrive Link]({link})"
+                if INDEX_URL:
+                    msg += f"\n⚡ [Direct Link]({INDEX_URL}/{name.replace(' ', '%20')})"
+                await c.send_message(task["chat_id"], msg, disable_web_page_preview=True)
             else:
                 await c.send_message(task["chat_id"], f"❌ Upload Failed: {link}")
 
