@@ -1,66 +1,79 @@
-import os, asyncio, time, json, libtorrent as lt, humanize
+import os
+import asyncio
+import time
+import json
+import libtorrent as lt
+import humanize
+import PTN
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.http import MediaFileUpload
 
-# --- 1. GLOBALS & CONFIG ---
+# --- 1. GLOBALS ---
+drive_service = None
+active_tasks = {}
+FILES_PER_PAGE = 8
+
+# --- 2. CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
 INDEX_URL = os.environ.get("INDEX_URL", "").rstrip('/')
 
-# Global variable for GDrive service
-drive_service = None
+# --- 3. GOOGLE DRIVE AUTHENTICATION (REPAIRED) ---
+def init_gdrive():
+    global drive_service
+    json_raw = os.environ.get("SERVICE_ACCOUNT_JSON")
+    if not json_raw:
+        print("❌ CRITICAL: SERVICE_ACCOUNT_JSON is missing from environment variables!")
+        return
 
-# --- 2. AUTHENTICATION INIT ---
-SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
-if SERVICE_ACCOUNT_JSON:
     try:
-        # Fix Koyeb newline escapes
-        json_data = json.loads(SERVICE_ACCOUNT_JSON.replace("\\n", "\n"))
+        # Fix Koyeb escaped newlines and quotes
+        json_fix = json_raw.replace("\\n", "\n").replace('\\"', '"')
+        creds_data = json.loads(json_fix)
+        
         with open('credentials.json', 'w') as f:
-            json.dump(json_data, f)
+            json.dump(creds_data, f)
         
         creds = service_account.Credentials.from_service_account_file(
             'credentials.json', 
             scopes=['https://www.googleapis.com/auth/drive']
         )
         drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-        print("✅ Google Drive Service Initialized")
+        print("✅ Google Drive Service Initialized Successfully")
     except Exception as e:
-        print(f"❌ Auth Initialization Error: {e}")
+        print(f"❌ GDrive Auth Initialization Failed: {e}")
 
-# Torrent Session
+init_gdrive()
+
+# --- 4. TORRENT ENGINE ---
 ses = lt.session()
 ses.listen_on(6881, 6891)
 
-active_tasks = {}
-FILES_PER_PAGE = 8
-
-# --- 3. HELPERS ---
+# --- 5. HELPERS ---
 
 def upload_to_gdrive(file_path, file_name):
     if not drive_service:
-        raise Exception("GDrive Service not initialized. Check your credentials.")
+        raise Exception("GDrive Service not initialized. Check logs for Auth errors.")
     
-    try:
-        # Final check: is the file empty?
-        if os.path.getsize(file_path) == 0:
-            raise Exception("File is 0 bytes. Torrent data not flushed to disk yet.")
-
-        meta = {'name': file_name, 'parents': [GDRIVE_FOLDER_ID]}
-        media = MediaFileUpload(file_path, mimetype='application/octet-stream', resumable=True)
-        request = drive_service.files().create(body=meta, media_body=media, fields='id, webViewLink')
+    if not os.path.exists(file_path):
+        raise Exception(f"File not found on disk: {file_path}")
         
-        response = None
-        while response is None:
-            status, response = request.next_chunk()
-        return response.get('webViewLink')
-    except Exception as e:
-        raise Exception(str(e))
+    if os.path.getsize(file_path) == 0:
+        raise Exception("File is empty (0 bytes). Torrent not flushed to disk.")
+
+    meta = {'name': file_name, 'parents': [GDRIVE_FOLDER_ID]}
+    media = MediaFileUpload(file_path, mimetype='application/octet-stream', resumable=True)
+    request = drive_service.files().create(body=meta, media_body=media, fields='id, webViewLink')
+    
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+    return response.get('webViewLink')
 
 def get_prog_bar(pct):
     p = int(pct / 10)
@@ -84,21 +97,18 @@ def gen_selection_kb(h_hash, page=0):
     btns.append([InlineKeyboardButton("❌ CANCEL", callback_data=f"ca_{h_hash}")])
     return InlineKeyboardMarkup(btns)
 
-# --- 4. HANDLERS ---
+# --- 6. HANDLERS ---
 
 app = Client("LeechBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 @app.on_message(filters.command("start"))
 async def start(c, m):
-    await m.reply_text("👋 Send a Magnet Link.")
+    await m.reply_text("🚀 Bot is ready. Send a magnet link to begin.")
 
 @app.on_message(filters.regex(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+"))
 async def handle_magnet(c, m):
     try:
         handle = lt.add_magnet_uri(ses, m.text, {'save_path': './downloads/'})
-        # Add trackers for speed
-        handle.add_tracker({'url': "udp://tracker.opentrackr.org:1337/announce", 'tier': 0})
-        
         msg = await m.reply_text("🧲 **Fetching Metadata...**")
         while not handle.has_metadata(): 
             await asyncio.sleep(1)
@@ -146,6 +156,7 @@ async def run_download(c, h_hash):
         handle.file_priority(idx, 4)
         f_name = file.path.split('/')[-1]
         
+        # Download Progress
         while True:
             if task["cancel"]: break
             s = handle.status()
@@ -162,31 +173,26 @@ async def run_download(c, h_hash):
             await asyncio.sleep(5)
 
         if not task["cancel"]:
-            # 1. Force Disk Flush
-            handle.save_resume_data() 
-            await asyncio.sleep(3) # Small buffer to let the OS close the file handle
+            # Ensure file is saved to disk
+            handle.save_resume_data()
+            await asyncio.sleep(5) # Delay to allow disk write
 
-            f_path = os.path.join("./downloads/", file.path)
+            # Robust Path Logic: check both root and subfolder
+            f_path_root = os.path.join("./downloads/", file.path)
+            f_path_sub = os.path.join("./downloads/", info.name(), file.path)
             
-            # 2. Path correction for multi-file torrents
-            # Libtorrent saves multi-file torrents in a subfolder named after the torrent
-            if not os.path.exists(f_path):
-                f_path = os.path.join("./downloads/", info.name(), file.path)
+            f_path = f_path_root if os.path.exists(f_path_root) else f_path_sub
 
             await c.edit_message_text(task["chat_id"], task["msg_id"], f"☁️ **Uploading to GDrive:** `{f_name}`")
             
             try:
-                # 3. Final Verification before upload
-                if os.path.exists(f_path) and os.path.getsize(f_path) > 0:
-                    loop = asyncio.get_event_loop()
-                    glink = await loop.run_in_executor(None, upload_to_gdrive, f_path, f_name)
-                    
-                    out = f"✅ **Uploaded:** `{f_name}`\n🔗 [GDrive Link]({glink})"
-                    if INDEX_URL:
-                        out += f"\n⚡ [Direct Link]({INDEX_URL}/{f_name.replace(' ', '%20')})"
-                    await c.send_message(task["chat_id"], out, disable_web_page_preview=True)
-                else:
-                    await c.send_message(task["chat_id"], f"❌ Error: File `{f_name}` is empty or not found on disk.")
+                loop = asyncio.get_event_loop()
+                glink = await loop.run_in_executor(None, upload_to_gdrive, f_path, f_name)
+                
+                out = f"✅ **Uploaded:** `{f_name}`\n🔗 [GDrive Link]({glink})"
+                if INDEX_URL:
+                    out += f"\n⚡ [Direct Link]({INDEX_URL}/{f_name.replace(' ', '%20')})"
+                await c.send_message(task["chat_id"], out, disable_web_page_preview=True)
             except Exception as e:
                 await c.send_message(task["chat_id"], f"❌ UPLOAD FAILED: `{f_name}`\nReason: {e}")
             finally:
