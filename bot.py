@@ -14,7 +14,6 @@ from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from googleapiclient.http import MediaFileUpload
 
-# --- CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -43,17 +42,11 @@ except Exception as e:
 # --- LIBTORRENT SETUP ---
 ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
 
-TRACKERS = [
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://exodus.desync.com:6969/announce"
-]
+TRACKERS = ["udp://tracker.opentrackr.org:1337/announce", "udp://open.stealth.si:80/announce", "udp://exodus.desync.com:6969/announce"]
 
 app = Client("KoyebBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 active_tasks = {}
 FILES_PER_PAGE = 8
-
-# --- HELPERS ---
 
 def upload_to_gdrive(file_path, file_name):
     if not drive_service: return "Error: Drive not configured."
@@ -92,8 +85,6 @@ def gen_keyboard(h_hash, page=0):
     btns.append([InlineKeyboardButton("❌ CANCEL", callback_data=f"cancel_{h_hash}")])
     return InlineKeyboardMarkup(btns)
 
-# --- HANDLERS ---
-
 @app.on_message(filters.command("start"))
 async def start_cmd(c, m):
     await m.reply_text("👋 **Torrent to GDrive Bot**\nSend a Magnet Link.")
@@ -109,22 +100,16 @@ async def handle_magnet(c, m):
         return await m.reply_text(f"❌ Error: {e}")
 
     msg = await m.reply_text("⏳ **Fetching Metadata...**")
-    
     while not handle.status().has_metadata:
         await asyncio.sleep(2)
     
-    info = handle.get_torrent_info()
+    t_info = handle.status().torrent_file
     h_hash = str(handle.info_hash())
-    files = [{"name": info.files().file_name(i), "size": info.files().file_size(i)} for i in range(info.num_files())]
+    files = [{"name": t_info.files().file_name(i), "size": t_info.files().file_size(i)} for i in range(t_info.num_files())]
 
-    active_tasks[h_hash] = {
-        "handle": handle, "files": files, "selected": [],
-        "chat_id": m.chat.id, "msg_id": msg.id, "cancel": False
-    }
-    
-    handle.prioritize_files([0] * info.num_files())
-    try:
-        await msg.edit(f"📂 **Metadata Found!**\nFiles: {len(files)}", reply_markup=gen_keyboard(h_hash))
+    active_tasks[h_hash] = {"handle": handle, "files": files, "selected": [], "chat_id": m.chat.id, "msg_id": msg.id, "cancel": False}
+    handle.prioritize_files([0] * t_info.num_files())
+    try: await msg.edit(f"📂 **Metadata Found!**\nFiles: {len(files)}", reply_markup=gen_keyboard(h_hash))
     except MessageNotModified: pass
 
 @app.on_callback_query()
@@ -133,24 +118,20 @@ async def cb_handler(c, q: CallbackQuery):
     action, h_hash = data[0], data[1]
     task = active_tasks.get(h_hash)
     if not task: return await q.answer("Task expired.", show_alert=True)
-    
     if action == "tog":
         idx, page = int(data[2]), int(data[3])
         if idx in task["selected"]: task["selected"].remove(idx)
         else: task["selected"].append(idx)
         try: await q.message.edit_reply_markup(gen_keyboard(h_hash, page))
         except MessageNotModified: pass
-    
     elif action == "page":
         try: await q.message.edit_reply_markup(gen_keyboard(h_hash, int(data[2])))
         except MessageNotModified: pass
-    
     elif action == "cancel":
         task["cancel"] = True
         ses.remove_torrent(task["handle"])
         active_tasks.pop(h_hash, None)
         await q.message.edit("❌ Cancelled.")
-    
     elif action == "start":
         if not task["selected"]: return await q.answer("Select a file!", show_alert=True)
         await q.answer("Starting...")
@@ -159,7 +140,6 @@ async def cb_handler(c, q: CallbackQuery):
 async def downloader(c, h_hash):
     task = active_tasks[h_hash]
     handle = task["handle"]
-    
     for idx in task["selected"]: handle.file_priority(idx, 4)
     
     while not handle.status().is_seeding:
@@ -168,36 +148,26 @@ async def downloader(c, h_hash):
         total = sum(task["files"][i]["size"] for i in task["selected"])
         done = sum(handle.file_progress()[i] for i in task["selected"])
         pct = (done / total * 100) if total > 0 else 0
-        
         try:
-            await c.edit_message_text(
-                chat_id=task["chat_id"], message_id=task["msg_id"],
-                text=f"📥 **Downloading...**\n[{get_prog_bar(pct)}] {pct:.1f}%\n⚡ {humanize.naturalsize(s.download_rate)}/s",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{h_hash}")]])
-            )
+            await c.edit_message_text(task["chat_id"], task["msg_id"], f"📥 **Downloading...**\n[{get_prog_bar(pct)}] {pct:.1f}%\n⚡ {humanize.naturalsize(s.download_rate)}/s", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{h_hash}")]]))
         except (MessageNotModified, FloodWait): pass
         if done >= total: break
         await asyncio.sleep(5)
         
     await c.edit_message_text(task["chat_id"], task["msg_id"], "📤 **Uploading to Drive...**")
-    
-    info = handle.get_torrent_info()
+    t_file = handle.status().torrent_file
     for idx in task["selected"]:
         if task["cancel"]: break
-        name = info.files().file_name(idx)
-        path = os.path.join(DOWNLOAD_DIR, info.files().file_path(idx))
-        
+        name, path = t_file.files().file_name(idx), os.path.join(DOWNLOAD_DIR, t_file.files().file_path(idx))
         if os.path.exists(path):
             try: await c.edit_message_text(task["chat_id"], task["msg_id"], f"☁️ **Uploading:** `{name}`")
             except MessageNotModified: pass
-            
             link = await asyncio.get_event_loop().run_in_executor(None, upload_to_gdrive, path, name)
             if "http" in str(link):
                 msg = f"✅ **{name}**\n🔗 [GDrive Link]({link})"
                 if INDEX_URL: msg += f"\n⚡ [Direct Link]({INDEX_URL}/{name.replace(' ', '%20')})"
                 await c.send_message(task["chat_id"], msg, disable_web_page_preview=True)
-            else:
-                await c.send_message(task["chat_id"], f"❌ Upload Failed: {link}")
+            else: await c.send_message(task["chat_id"], f"❌ Upload Failed: {link}")
 
     ses.remove_torrent(handle)
     active_tasks.pop(h_hash, None)
